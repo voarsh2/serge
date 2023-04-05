@@ -1,24 +1,12 @@
 import asyncio
+import redis
 
 from fastapi import APIRouter, HTTPException, Depends
 from sse_starlette.sse import EventSourceResponse
 from beanie.odm.enums import SortDirection
 
 from serge.models.chat import Question, Chat,ChatParameters
-from serge.utils.generate import generate, get_full_prompt_from_chat
-
-async def on_close(chat, prompt, answer=None, error=None):
-    question = await Question(question=prompt.rstrip(), 
-                              answer=answer.rstrip() if answer != None else None, 
-                              error=error).create()
-
-    if chat.questions is None:
-        chat.questions = [question]
-    else:
-        chat.questions.append(question)
-
-    await chat.save()
-
+from loguru import logger
 
 def remove_matching_end(a, b):
     min_length = min(len(a), len(b))
@@ -61,6 +49,13 @@ async def create_new_chat(
     ).create()
 
     chat = await Chat(parameters=parameters).create()
+    client = redis.Redis()
+
+    client.rpush("load_queue", str(chat.id))
+    
+    while not client.sismember("loaded_chats", str(chat.id)):
+        await asyncio.sleep(0.05)
+    
     return chat.id
 
 
@@ -75,12 +70,25 @@ async def get_all_chats():
         await i.fetch_link(Chat.questions)
 
         first_q = i.questions[0].question if i.questions else ""
+
+        client = redis.Redis()
+        if client.sismember("loaded_chats", str(i.id)):
+            stream = client.get("stream:" + str(i.id))
+            if stream != None and stream != "EOF":
+                status = "streaming"
+            else:
+                status = "loaded"
+        else:
+            status = "unloaded"
+        
+
         res.append(
             {
                 "id": i.id,
                 "created": i.created,
                 "model": i.parameters.model,
                 "subtitle": first_q,
+                "status" : status
             }
         )
 
@@ -94,11 +102,33 @@ async def get_specific_chat(chat_id: str):
 
     return chat
 
+@chat_router.get("/{chat_id}/status")
+async def get_chat_status(chat_id: str):
+    client = redis.Redis()
+    if client.sismember("loaded_chats", chat_id):
+        stream = client.get("stream:" + chat_id)
+        if stream != None and stream.decode() != "EOF":
+            status = "streaming"
+        else:
+            status = "loaded"
+    else:
+        status = "unloaded"
+        
+    return status
+
+
 @chat_router.delete("/{chat_id}" )
 async def delete_chat(chat_id: str):
     chat = await Chat.get(chat_id)
     deleted_chat = await chat.delete()
 
+    client = redis.Redis()
+    client.rpush("unload_queue", str(chat.id))
+
+    
+    while client.sismember("loaded_chats", str(chat.id)):
+        await asyncio.sleep(0.05)
+    
     if deleted_chat:
         return {"message": f"Deleted chat with id: {chat_id}"}
     else:
@@ -106,66 +136,39 @@ async def delete_chat(chat_id: str):
 
 
 
-@chat_router.get("/{chat_id}/question")
-async def stream_ask_a_question(chat_id: str, prompt: str):
-    
-    chat = await Chat.get(chat_id)
-    await chat.fetch_link(Chat.parameters)
-
-    full_prompt = await get_full_prompt_from_chat(chat, prompt)
-    
-    chunks = []
-
-    async def event_generator():
-        full_answer = ""
-        error = None
-        try:
-            async for output in generate(
-                prompt=full_prompt,
-                params=chat.parameters,
-            ):
-                await asyncio.sleep(0.01)
-
-                chunks.append(output)
-                full_answer += output
-                
-                if full_prompt in full_answer:
-                    cleaned_chunk = remove_matching_end(full_prompt, output)
-                    yield {
-                        "event": "message", 
-                        "data": cleaned_chunk}
-                
-        except Exception as e:
-            error = e.__str__()
-            yield({"event" : "error"})
-        finally:
-            answer = "".join(chunks)[len(full_prompt)+1:]
-            await on_close(chat, prompt, answer, error)
-            yield({"event" : "close"})
-
-
-    return EventSourceResponse(event_generator())
-
 @chat_router.post("/{chat_id}/question")
 async def ask_a_question(chat_id: str, prompt: str):
-    chat = await Chat.get(chat_id)
-    await chat.fetch_link(Chat.parameters)
-
-    full_prompt = await get_full_prompt_from_chat(chat, prompt)
+    client = redis.Redis()
     
-    answer = ""
-    error = None
+    logger.info(f"Asking question {prompt} to chat {chat_id}")
+    client.set(f"stream:{chat_id}", "")
+    
+    if client.sismember("loaded_chats", chat_id):
+        client.rpush(f"questions:{chat_id}", prompt)
+    else:
+        logger.info(f"Chat {chat_id} not loaded, loading it.")
+        client.rpush("load_queue", str(chat_id))
+        while not client.sismember("loaded_chats", str(chat_id)):
+            await asyncio.sleep(0.05)   
+        
+        logger.info(f"Re-Asking question {prompt} to chat {chat_id}")
+        client.rpush(f"questions:{chat_id}", prompt)
+    
+    return {"message": "Question added to queue."}
 
-    try:
-        async for output in generate(
-            prompt=full_prompt,
-            params=chat.parameters,
-        ):
-            await asyncio.sleep(0.01)
-            answer += output
-    except Exception as e:
-            error = e.__str__()
-    finally:
-        await on_close(chat, prompt, answer=answer[len(full_prompt)+1:], error=error)
+@chat_router.get("/{chat_id}/stream")
+async def stream_chat(chat_id: str):
+    client = redis.Redis()
 
-    return {"question" : prompt, "answer" : answer[len(full_prompt)+1:]}
+    if client.sismember("loaded_chats", chat_id):
+        stream = client.get(f"stream:{chat_id}")
+        if stream != None:
+            return {
+                "question" : client.lindex(f"questions:{chat_id}", 1),
+                "answer" : stream.decode("utf-8")}
+        else:
+            return {
+                "question" : "",
+                "answer" : ""}
+    else:
+        return {"message": f"Chat {chat_id} not loaded."}

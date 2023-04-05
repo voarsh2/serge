@@ -1,8 +1,11 @@
 #!/bin/bash
 ./compile.sh
 
-mongod &
+redis-server &
 
+mongod --quiet --logpath /dev/null &
+
+python3 /usr/src/app/api/src/serge/worker/orchestrator.py &
 # Start the API
 cd api && uvicorn src.serge.main:app --host 0.0.0.0 --port 8008 &
 

@@ -1,6 +1,5 @@
 import asyncio
-import logging
-import os
+import os, sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,16 +11,15 @@ from serge.routers.model import model_router
 from serge.utils.initiate_database import initiate_database, Settings
 from serge.utils.convert import convert_all
 
-# Configure logging settings
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s:\t%(name)s\t%(message)s",
-    handlers=[logging.StreamHandler()],
+import uvicorn
+
+from loguru import logger
+
+logger.add(
+    sys.stderr, format="{time} {level} {message}", colorize=True, level="INFO"
 )
 
 # Define a logger for the current module
-logger = logging.getLogger(__name__)
-
 settings = Settings()
 
 tags_metadata = [
@@ -103,3 +101,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port="9124", root_path="/api/")

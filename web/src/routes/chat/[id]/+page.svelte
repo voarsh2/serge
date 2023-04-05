@@ -2,56 +2,81 @@
   import type { PageData } from "./$types";
   import { invalidate } from "$app/navigation";
   import { page } from "$app/stores";
+  import { browser } from "$app/environment";
 
   export let data: PageData;
+  let clear: number;
 
   $: isLoading = false;
   $: questions = data.props.questions ?? [];
   $: startDate = new Date(data.props.created);
 
   $: prompt = "";
-  $: answer = "";
 
-  async function askQuestion() {
-    if (prompt) {
-      const data = new URLSearchParams();
-      data.append("prompt", prompt);
-
-      const eventSource = new EventSource(
-        "/api/chat/" + $page.params.id + "/question?" + data.toString()
-      );
-
-      questions = [
-        ...questions,
-        {
-          _id: (questions.length + 1).toString(),
-          question: prompt,
-          answer: "",
-        },
-      ];
-
-      prompt = "";
-
-      eventSource.addEventListener("message", (event) => {
-        questions[questions.length - 1].answer += event.data;
+  $: if (browser) {
+    void fetch("/api/chat/" + $page.params.id + "/status")
+      .then((r) => r.json())
+      .then((data) => {
+        if (data === "streaming") {
+          void streamPage();
+        }
       });
-
-      eventSource.addEventListener("close", async () => {
-        eventSource.close();
-        await invalidate("/api/chat/" + $page.params.id);
-      });
-
-      eventSource.onerror = async (error) => {
-        eventSource.close();
-        questions[questions.length - 1].answer = "A server error occurred.";
-        await invalidate("/api/chat/" + $page.params.id);
-      };
-    }
   }
 
-  function handleKeyDown(event) {
+  const streamPage = async () => {
+    const requestStream = await fetch(
+      "/api/chat/" + $page.params.id + "/stream"
+    );
+
+    const dataStream = await requestStream.json();
+
+    if (dataStream.answer === "EOF") {
+      await invalidate("/api/chat/" + $page.params.id);
+      return;
+    } else {
+      if (
+        questions.length > 0 &&
+        questions[questions.length - 1]._id === "STREAM"
+      ) {
+        questions[questions.length - 1].question = dataStream.question;
+        questions[questions.length - 1].answer = dataStream.answer;
+      } else {
+        questions = [
+          ...questions,
+          {
+            _id: "STREAM",
+            question: dataStream.question,
+            answer: dataStream.answer,
+          },
+        ];
+      }
+    }
+
+    setTimeout(streamPage, 500);
+  };
+
+  const askQuestion = async () => {
+    if (prompt) {
+      const params = new URLSearchParams();
+      params.append("prompt", prompt);
+
+      isLoading = true;
+      const r = await fetch(
+        "/api/chat/" + $page.params.id + "/question?" + params.toString(),
+        {
+          method: "POST",
+        }
+      );
+
+      isLoading = false;
+      prompt = "";
+      await streamPage();
+    }
+  };
+
+  async function handleKeyDown(event: KeyboardEvent) {
     if (event.key === "Enter" && event.ctrlKey) {
-      askQuestion();
+      await askQuestion();
     }
   }
 </script>
